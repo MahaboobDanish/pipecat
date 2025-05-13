@@ -86,28 +86,12 @@ class CallFlowState:
         self.current_operator_index += 1
         return self.get_current_dialout_setting()
 
-    # post call summary related
-    # def duration(self):
-    #     """Get call duration in seconds"""
-    #     end = self.end_time or datetime.now()
-    #     return (end - self.start_time).total_seconds()
 
     def finalize_call(self):
         """Mark call completion and calculate duration"""
-        # if not self.end_time:
-        #     self.end_time = datetime.now()
         self.end_time = datetime.now()
         self.duration = (self.end_time - self.start_time).total_seconds()
 
-    # def get_summary(self) -> dict:
-    #     """Generate post-call statistics"""
-    #     return {
-    #         "duration_seconds": self.duration,
-    #         "silence_events": self.silence_events,
-    #         "termination_reason": self.termination_reason,
-    #         "unanswered_prompts": self.unanswered_prompts,
-    #     }
-    # Voicemail detection methods
     def set_voicemail_detected(self):
         """Mark that a voicemail system has been detected."""
         self.voicemail_detected = True
