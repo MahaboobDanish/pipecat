@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import os
 import sys
+import json
 
 from call_connection_manager import CallConfigManager, SessionManager
 from dotenv import load_dotenv
@@ -26,6 +27,10 @@ from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.services.daily import DailyDialinSettings, DailyParams, DailyTransport
 
+# Add these new imports at the top (Part of silence detection infrastructure)
+from datetime import datetime
+from pipecat.frames.frames import TextFrame
+
 load_dotenv(override=True)
 
 logger.remove(0)
@@ -34,6 +39,122 @@ logger.add(sys.stderr, level="DEBUG")
 daily_api_key = os.getenv("DAILY_API_KEY", "")
 daily_api_url = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 
+# Constants for configuration (Implements silence timeout and prompt thresholds)
+SILENCE_TIMEOUT = 10  # seconds
+MAX_UNANSWERED_PROMPTS = 3
+CHECK_INTERVAL = 1  # second between silence checks
+
+class SilenceMonitor:
+    def __init__(self, session_manager, tts_service, llm_service):
+        # Stores call session state (Part of state management)
+        self.session_manager = session_manager
+        # TTS service for prompts (Implements TTS prompt playback)
+        self.tts = tts_service  
+        # LLM service for message queuing (Handles termination)
+        self.llm = llm_service
+        # Timing and counters (Core silence detection logic)
+        self.last_activity_time = datetime.now()
+        self.unanswered_prompts = 0
+        self.active = False
+    
+    async def check_silence(self):
+        if not self.active or self.session_manager.call_flow_state.call_terminated:
+            return  # Exit early if monitoring is disabled or call already terminated
+
+        silence_duration = (datetime.now() - self.last_activity_time).total_seconds()
+        logger.debug(f"Silence check: {silence_duration:.1f}s of silence")
+
+        if silence_duration > SILENCE_TIMEOUT:
+            # Prevent multiple increments if we're already over threshold
+            if self.unanswered_prompts >= MAX_UNANSWERED_PROMPTS:
+                return  # Already reached max prompts
+            
+            self.unanswered_prompts += 1
+            self.session_manager.call_flow_state.silence_events += 1
+            
+            logger.debug(f"Unanswered prompts: {self.unanswered_prompts}/{MAX_UNANSWERED_PROMPTS}")
+            self.session_manager.call_flow_state.unanswered_prompts = self.unanswered_prompts
+            if self.unanswered_prompts >= MAX_UNANSWERED_PROMPTS:
+                logger.info("Max unanswered prompts reached - terminating call")
+                await self.terminate_call()
+                return  # Critical - exit after termination
+                
+            try:
+                # Play TTS prompt with cooldown
+                self.prompt = "Are you still there? Please let me know how I can help."
+                logger.info(f"Playing silence prompt # {self.prompt}")
+                
+                # Queue prompt through LLM and TTS
+                await self.llm.queue_frame(TextFrame(self.prompt))
+                # await self.tts.run_tts(self.prompt)
+                
+                # # Add cooldown period after prompt (prevents immediate re-trigger)
+                # self.last_activity_time = datetime.now() + timedelta(seconds=5)
+                
+            except Exception as e:
+                logger.error(f"Failed to queue TTS prompt: {e}")
+                self.reset_timer()
+
+    
+        
+    def reset_timer(self):
+        """Resets detection timers on user activity"""
+        self.last_activity_time = datetime.now()
+        
+    def start_monitoring(self):
+        """Enables monitoring when call becomes active"""
+        self.active = True
+        self.reset_timer()
+        # Start periodic checking (Enables continuous monitoring)
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+        # asyncio.create_task(self._monitor_loop())
+        
+    async def _monitor_loop(self):
+        """Background task for periodic silence checks"""
+        while self.active:
+            await self.check_silence()
+            await asyncio.sleep(CHECK_INTERVAL)
+
+
+    async def terminate_call(self):
+        """Handles call termination flow"""
+        # Prevent multiple termination attempts
+        if self.session_manager.call_flow_state.call_terminated:
+            return
+            
+        logger.info("Max unanswered prompts reached - terminating call")
+        
+        # 1. Finalize call stats first
+        self.session_manager.call_flow_state.finalize_call()
+        self.session_manager.call_flow_state.termination_reason = \
+            f"Terminated after {MAX_UNANSWERED_PROMPTS} unanswered prompts"
+        
+        # 2. Log summary before any cleanup
+        await self._log_summary()
+        
+        # 3. Stop monitoring
+        self.active = False
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            
+        # 4. Initiate termination
+        await self.llm.queue_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+
+    async def _log_summary(self):
+        """Log call summary if not already logged"""
+        if not self.session_manager.call_flow_state.summary_finished:
+            cf_state = self.session_manager.call_flow_state
+            cf_state.end_time = datetime.now()  # Ensure end_time is set
+            
+            summary = {
+                "duration_seconds": round(cf_state.duration, 2),
+                "silence_events": cf_state.silence_events,
+                "unanswered_prompts": cf_state.unanswered_prompts,
+                "termination_reason": cf_state.termination_reason
+            }
+            
+            logger.info(f"Call summary: {json.dumps(summary, indent=2)}")
+            cf_state.summary_finished = True
 
 async def main(
     room_url: str,
@@ -130,6 +251,10 @@ async def main(
     # Register functions with the LLM
     llm.register_function("terminate_call", terminate_call)
 
+    # As the LLM Context and Message is used in our Silence Monitor initialize the SilenceMonitor here
+    silence_monitor = SilenceMonitor(session_manager, tts, llm)
+    # silence_monitor.start_monitoring()
+
     # Create system message and initialize messages list
     messages = [call_config_manager.create_system_message(system_instruction)]
 
@@ -158,13 +283,30 @@ async def main(
 
     @transport.event_handler("on_first_participant_joined")
     async def on_first_participant_joined(transport, participant):
+        session_manager.call_flow_state.start_time = datetime.now()
         logger.debug(f"First participant joined: {participant['id']}")
         await transport.capture_participant_transcription(participant["id"])
         await task.queue_frames([context_aggregator.user().get_context_frame()])
+        # start the monitoring as participant joined the call
+        silence_monitor.start_monitoring()
 
+    # Events to detect the speech
+    @transport.event_handler("on_dialout_answered")
+    async def on_speech_start(transport,frame):
+        silence_monitor.reset_timer()
+
+    @transport.event_handler("on_dialout_stopped")
+    async def on_speech_stop(transport, frame):
+        silence_monitor.reset_timer()
+
+    
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
-        logger.debug(f"Participant left: {participant}, reason: {reason}")
+        cf_state = session_manager.call_flow_state
+        if not cf_state.summary_finished:
+            cf_state.termination_reason = f"Participant left: {reason}"
+            cf_state.finalize_call()
+            await silence_monitor._log_summary()
         await task.cancel()
 
     # ------------ RUN PIPELINE ------------
